@@ -1,0 +1,24 @@
+# Network block: fixed IP, two DNS servers, fallback hotspot + captive portal, Wi-Fi watchdog.
+# Every value comes from substitutions, set in site.yaml (not committed; see site.example.yaml).
+# These are only the factory defaults: at runtime the admin page (components/interfon_admin)
+# owns the network settings and re-applies them at boot.
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: ${static_ip}
+    gateway: ${gateway}
+    subnet: ${subnet}
+    dns1: ${dns1}
+    dns2: ${dns2}
+  # Can't join Wi-Fi? The device opens its own hotspot: connect, open http://192.168.4.1
+  # and fix the settings from the admin page or the captive portal.
+  ap:
+    ssid: "${name}-fallback"
+    password: !secret ap_password
+  reboot_timeout: 15min   # no Wi-Fi for 15 min -> reboot and try again
+
+captive_portal:
+
+# No `time:` here on purpose: timezone and on_time_sync actions are per device, and ESPHome
+# will not merge two time sources with the same id.

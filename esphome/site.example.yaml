@@ -1,0 +1,8 @@
+# Copy to site.yaml and fill in your network. site.yaml is git-ignored.
+# Pick a fixed IP OUTSIDE your router's DHCP pool so it can never be handed to another device.
+substitutions:
+  static_ip: 192.168.1.50
+  gateway: 192.168.1.1
+  subnet: 255.255.255.0
+  dns1: 192.168.1.1     # your local DNS (router, AdGuard, Pi-hole...)
+  dns2: 1.1.1.1         # fallback while the local DNS is unavailable

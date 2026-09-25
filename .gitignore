@@ -1,0 +1,29 @@
+# ALLOWLIST: ignore everything, then name exactly what may be published.
+# Credentials, build output and compiled firmware (which embeds credentials) must never be
+# published.
+# A new file stays private until it is added here on purpose.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/serial_monitor.py
+!/docs/
+!/esphome/
+
+/esphome/*
+!/esphome/interfon.yaml
+!/esphome/interfon-ui.js
+!/esphome/site.example.yaml
+!/esphome/secrets.example.yaml
+!/esphome/common/
+!/esphome/components/
+
+# never, wherever they appear
+secrets.yaml
+site.yaml
+*.bin
+*.bak*
+.esphome/
+__pycache__/
+*.pyc
+.DS_Store

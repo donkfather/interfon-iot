@@ -1,0 +1,370 @@
+# Interfon: standalone intercom controller (Genway handset + relay board, Wemos D1 mini).
+# Pin map and wiring: see ../README.md.
+#
+# Talks to Home Assistant and Homey over the ESPHome native API (port 6053).
+# Home Assistant: Settings > Devices > ESPHome, it is auto-discovered.
+# Homey: the "ESPHome" community app, add device by IP with the same API encryption key.
+#
+# It also serves its own web page + REST API at http://interfon.local (digest auth, see
+# secrets.yaml). NOTE: REST paths use the entity NAME, url-encoded, not a snake_case id:
+#   GET  /text_sensor/History              GET  /text_sensor/Last%20ring
+#   GET  /binary_sensor/Ring               GET  /sensor/Ring%20count
+#   GET  /switch/Auto-answer               GET  /sensor/Door%20opens
+#   POST /button/Open%20door/press         opens the door
+#   POST /switch/Auto-answer/turn_on       (also turn_off, toggle)
+#   GET  /events                           server-sent events, every state change
+#
+# Admin (components/interfon_admin): network, MQTT and notification channels are RUNTIME
+# settings, edited on the device's own page and stored in dedicated flash sectors. Nothing
+# about where notifications go is compiled into the firmware.
+#   GET  /admin/settings   GET /admin/info   POST /admin/settings   POST /admin/test?what=webhook|mqtt
+#   POST /admin/reboot
+#
+substitutions:
+  name: interfon
+  friendly_name: Interfon
+  pin_ring: GPIO13          # D7: call-detect from the board, a call pulls it LOW
+  pin_relay_pickup: GPIO14  # D5: ULN2003 -> K1 (+180R across the line), lifts the handset
+  pin_relay_door: GPIO12    # D6: ULN2003 -> K2, presses the handset's door button
+  pin_button: GPIO4         # D2: local push button to GND
+  pin_led: GPIO2            # D4: on-board LED, active low
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: refresh_texts
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: true
+
+preferences:
+  flash_write_interval: 30s
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    encryption: {}   # inherits the api key
+
+# Network: site.yaml (git-ignored, see site.example.yaml) holds this installation's addresses;
+# common/network.yaml turns them into the Wi-Fi block (fixed IP, 2 DNS, fallback hotspot).
+packages:
+  site: !include site.yaml
+  network: !include common/network.yaml
+
+wifi:
+  ap:
+    ssid: "Interfon WiFi"   # keep the recovery hotspot name this device already uses
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+# Runtime settings + /admin API. The defaults are only used until settings are first saved.
+interfon_admin:
+  id: admin
+  time_id: sntp_time
+  default_ssid: !secret wifi_ssid
+  default_password: !secret wifi_password
+  default_static_ip: ${static_ip}
+  default_gateway: ${gateway}
+  default_subnet: ${subnet}
+  default_dns1: ${dns1}
+  default_dns2: ${dns2}
+  default_mqtt_prefix: ${name}
+
+# MQTT is configured on the admin page (broker, login, prefix). The broker below is a
+# placeholder that is replaced at boot; the client only starts if MQTT is enabled there.
+mqtt:
+  broker: mqtt.invalid
+  enable_on_boot: false
+  discovery: true
+  topic_prefix: ${name}
+  log_topic: null
+
+web_server:
+  port: 80
+  version: 3
+  js_url: ""                 # no UI from the internet: the page below is built into the firmware
+  js_include: interfon-ui.js
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Bucharest
+    on_time_sync:
+      then:
+        - script.execute: refresh_texts
+        - component.update: device_time
+
+status_led:
+  pin:
+    number: ${pin_led}
+    inverted: true
+
+# ---- persistent state (survives reboots) ------------------------------------
+# event kinds: 0 empty, 1 ring, 2 door auto, 3 door remote, 4 door button
+globals:
+  - id: hist_time            # epoch seconds, newest first; 0 = time unknown
+    type: uint32_t[10]
+    restore_value: true
+  - id: hist_kind
+    type: uint8_t[10]
+    restore_value: true
+  - id: ring_total
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: door_total
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_ring_epoch
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_door_epoch
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_door_kind
+    type: uint8_t
+    restore_value: true
+    initial_value: '0'
+  - id: last_ring_ms         # for the 10 s repeat inhibit, not persisted
+    type: uint32_t
+    initial_value: '0'
+
+script:
+  # Append one event to the history and refresh everything derived from it.
+  - id: log_event
+    parameters:
+      kind: int
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          uint32_t ts = now.is_valid() ? now.timestamp : 0;
+          for (int i = 9; i > 0; i--) {
+            id(hist_time)[i] = id(hist_time)[i - 1];
+            id(hist_kind)[i] = id(hist_kind)[i - 1];
+          }
+          id(hist_time)[0] = ts;
+          id(hist_kind)[0] = kind;
+          if (kind == 1) {
+            id(ring_total) += 1;
+            id(last_ring_epoch) = ts;
+          } else {
+            id(door_total) += 1;
+            id(last_door_epoch) = ts;
+            id(last_door_kind) = kind;
+          }
+          id(admin).notify_event(kind);   // webhook / MQTT, per the admin settings
+      - script.execute: refresh_texts
+
+  - id: refresh_texts
+    then:
+      - lambda: |-
+          static const char *KIND[] = {"", "ring", "door auto", "door remote", "door button"};
+          auto stamp = [](uint32_t ts, const char *fmt) -> std::string {
+            if (ts == 0) return std::string("(no time)");
+            return ESPTime::from_epoch_local(ts).strftime(fmt);
+          };
+          std::string h;
+          for (int i = 0; i < 10; i++) {
+            if (id(hist_kind)[i] == 0) break;
+            if (!h.empty()) h += " | ";
+            h += stamp(id(hist_time)[i], "%d.%m %H:%M") + " " + KIND[id(hist_kind)[i]];
+          }
+          if (h.empty()) h = "no events yet";
+          if (h.size() > 255) h.resize(255);
+          id(history_text).publish_state(h);
+          id(last_ring_text).publish_state(id(last_ring_epoch) == 0 && id(ring_total) == 0
+              ? "never" : stamp(id(last_ring_epoch), "%d.%m.%Y %H:%M:%S"));
+          id(last_door_text).publish_state(id(last_door_kind) == 0
+              ? "never" : stamp(id(last_door_epoch), "%d.%m.%Y %H:%M:%S") + " (" + KIND[id(last_door_kind)] + ")");
+          id(mode_text).publish_state(id(auto_answer).state ? "auto" : "manual");
+          id(ring_count).publish_state(id(ring_total));
+          id(door_count).publish_state(id(door_total));
+
+  # Door sequence: pick up, 1 s, door button 2 s, 1 s, hang up.
+  - id: open_door
+    mode: single            # a trigger while the sequence runs is ignored
+    parameters:
+      cause: int            # 2 auto, 3 remote, 4 button
+    then:
+      - script.execute:
+          id: log_event
+          kind: !lambda return cause;
+      - switch.turn_on: relay_pickup
+      - delay: 1s
+      - switch.turn_on: relay_door
+      - delay: 2s
+      - switch.turn_off: relay_door
+      - delay: 1s
+      - switch.turn_off: relay_pickup
+
+# ---- entities ---------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    name: "Ring"
+    id: ring
+    icon: mdi:bell-ring
+    # device_class drives how hubs map this entity. Homey's ESPHome apps only build a
+    # trigger card when the entity maps to one of their alarm capabilities, and they
+    # ship a motion driver, so "motion" is what makes a Ringing trigger appear there.
+    device_class: motion
+    pin:
+      number: ${pin_ring}
+      mode: input           # the relay board drives this line, no pull-up needed
+      inverted: true        # idle HIGH, call LOW
+    filters:
+      - delayed_on: 100ms   # ignore line noise shorter than a real ring
+      - delayed_off: 3s
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(last_ring_ms) == 0 || millis() - id(last_ring_ms) >= 10000;'
+          then:
+            - lambda: 'id(last_ring_ms) = millis();'
+            - script.execute:
+                id: log_event
+                kind: 1
+            - if:
+                condition:
+                  switch.is_on: auto_answer
+                then:
+                  - script.execute:
+                      id: open_door
+                      cause: 2
+
+  - platform: gpio
+    name: "Button"
+    icon: mdi:gesture-tap-button
+    pin:
+      number: ${pin_button}
+      mode:
+        input: true
+        pullup: true
+      inverted: true        # button to GND
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - script.execute:
+          id: open_door
+          cause: 4
+
+button:
+  - platform: template
+    name: "Simulate ring"
+    icon: mdi:bell-alert
+    entity_category: diagnostic
+    # Drives the real Ring entity, so everything downstream behaves exactly like a call:
+    # the hub trigger fires, the event is logged, notifications go out, and auto-answer runs.
+    # Safe to press: with no live call the line is dead, so the relays click but no door opens.
+    on_press:
+      - lambda: 'id(ring).publish_state(true);'
+      - delay: 1s
+      - lambda: 'id(ring).publish_state(false);'
+
+  - platform: template
+    name: "Open door"
+    icon: mdi:door-open
+    on_press:
+      - script.execute:
+          id: open_door
+          cause: 3
+
+switch:
+  - platform: template
+    name: "Auto-answer"
+    id: auto_answer
+    icon: mdi:door-sliding-open
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: refresh_texts
+      - lambda: 'id(admin).notify_auto_answer(true);'
+    on_turn_off:
+      - script.execute: refresh_texts
+      - lambda: 'id(admin).notify_auto_answer(false);'
+  - platform: gpio
+    name: "Handset off-hook"
+    id: relay_pickup
+    pin: ${pin_relay_pickup}
+    icon: mdi:phone-in-talk
+    restore_mode: ALWAYS_OFF
+    entity_category: diagnostic
+  - platform: gpio
+    name: "Door relay"
+    id: relay_door
+    pin: ${pin_relay_door}
+    icon: mdi:door
+    restore_mode: ALWAYS_OFF
+    entity_category: diagnostic
+
+sensor:
+  - platform: template
+    name: "Ring count"
+    id: ring_count
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never
+  - platform: template
+    name: "Door opens"
+    id: door_count
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    name: "Last ring"
+    id: last_ring_text
+    icon: mdi:bell-badge
+    update_interval: never
+  - platform: template
+    name: "Last door open"
+    id: last_door_text
+    icon: mdi:door-open
+    update_interval: never
+  - platform: template
+    name: "Mode"
+    id: mode_text
+    icon: mdi:tune
+    update_interval: never
+
+  - platform: template
+    name: "Device time"
+    id: device_time
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      auto now = id(sntp_time).now();
+      if (!now.is_valid()) return {"not synced"};
+      return {now.strftime("%d.%m.%Y %H:%M:%S")};
+
+  - platform: template
+    name: "History"
+    id: history_text
+    icon: mdi:history
+    update_interval: never
